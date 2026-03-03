@@ -12,11 +12,11 @@ on:
         description: "AWS account ID for ECR login"
         required: true
         type: string
+      role-to-assume:
+        description: "ARN of the IAM role to assume via OIDC (output of iam-oidc-provider Terraform module)"
+        required: true
+        type: string
     secrets:
-      ECR_CI_AWS_ACCESS_KEY_ID:
-        required: true
-      ECR_CI_AWS_SECRET_ACCESS_KEY:
-        required: true
       ECR_REPOSITORY_POLICY_JSON:
         required: true
 
@@ -63,11 +63,10 @@ jobs:
           echo "full_sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
           echo "short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> $GITHUB_OUTPUT
 
-      - name: Configure AWS credentials (Access Keys)
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.ECR_CI_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.ECR_CI_AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR repository exists
