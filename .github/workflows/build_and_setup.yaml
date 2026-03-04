@@ -8,10 +8,6 @@ on:
         required: false
         type: string
         default: us-west-2
-      aws-account-id:
-        description: "AWS account ID for ECR login"
-        required: true
-        type: string
       role-to-assume:
         description: "ARN of the IAM role to assume via OIDC (output of iam-oidc-provider Terraform module)"
         required: true
@@ -93,8 +89,6 @@ jobs:
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-        with:
-          registries: ${{ inputs.aws-account-id }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
