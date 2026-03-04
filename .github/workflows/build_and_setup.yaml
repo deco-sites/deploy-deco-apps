@@ -16,9 +16,10 @@ on:
         description: "ARN of the IAM role to assume via OIDC (output of iam-oidc-provider Terraform module)"
         required: true
         type: string
-    secrets:
-      ECR_REPOSITORY_POLICY_JSON:
+      ecr-repository-policy-json:
+        description: "ECR repository policy JSON to apply on first pipeline run"
         required: true
+        type: string
 
 env:
   AWS_REGION: ${{ inputs.aws-region }}
@@ -71,7 +72,7 @@ jobs:
 
       - name: Ensure ECR repository exists
         env:
-          ECR_REPOSITORY_POLICY_JSON: ${{ secrets.ECR_REPOSITORY_POLICY_JSON }}
+          ECR_REPOSITORY_POLICY_JSON: ${{ inputs.ecr-repository-policy-json }}
         run: |
           if aws ecr describe-repositories --repository-names ${{ steps.ecr-repo.outputs.name }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
             echo "Repository ${{ steps.ecr-repo.outputs.name }} already exists"
