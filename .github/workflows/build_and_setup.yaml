@@ -16,6 +16,11 @@ on:
         description: "ECR repository policy JSON to apply on first pipeline run"
         required: true
         type: string
+      platforms:
+        description: "Docker build platforms (e.g. linux/amd64 or linux/amd64,linux/arm64)"
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
 
 env:
   AWS_REGION: ${{ inputs.aws-region }}
@@ -103,7 +108,7 @@ jobs:
             ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}
           build-args: |
             GIT_REVISION=${{ steps.meta.outputs.full_sha }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ inputs.platforms }}
           provenance: false
           sbom: false
 
