@@ -21,6 +21,11 @@ on:
         required: false
         type: string
         default: linux/amd64,linux/arm64
+      cache-mode:
+        description: "BuildKit GHA cache export mode: 'max' exports all intermediate layers, 'min' exports only the final image layer"
+        required: false
+        type: string
+        default: max
 
 env:
   AWS_REGION: ${{ inputs.aws-region }}
@@ -111,6 +116,8 @@ jobs:
           platforms: ${{ inputs.platforms }}
           provenance: false
           sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=${{ inputs.cache-mode }}
 
       - name: Update deploy/values-custom.yaml with short SHA
         run: |
