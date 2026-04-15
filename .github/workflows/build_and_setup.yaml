@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: max
+      extra-cache-from:
+        description: "Additional cache-from source passed to BuildKit (e.g. type=registry,ref=<image>). Appended after the default GHA cache source."
+        required: false
+        type: string
+        default: ""
 
 env:
   AWS_REGION: ${{ inputs.aws-region }}
@@ -116,7 +121,9 @@ jobs:
           platforms: ${{ inputs.platforms }}
           provenance: false
           sbom: false
-          cache-from: type=gha
+          cache-from: |
+            type=gha
+            ${{ inputs.extra-cache-from }}
           cache-to: type=gha,mode=${{ inputs.cache-mode }}
 
       - name: Update deploy/values-custom.yaml with short SHA
