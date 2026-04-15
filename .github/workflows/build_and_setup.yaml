@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ""
+      pre-built-assets-artifact:
+        description: "Name of a GHA artifact containing pre-built static assets (e.g. _fresh/) to include in the Docker build context before building."
+        required: false
+        type: string
+        default: ""
 
 env:
   AWS_REGION: ${{ inputs.aws-region }}
@@ -49,6 +54,13 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Download pre-built assets
+        if: inputs.pre-built-assets-artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.pre-built-assets-artifact }}
+          path: _fresh/
 
       - name: Get ECR repository name from values file
         id: ecr-repo
@@ -116,8 +128,6 @@ jobs:
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}
-          build-args: |
-            GIT_REVISION=${{ steps.meta.outputs.full_sha }}
           platforms: ${{ inputs.platforms }}
           provenance: false
           sbom: false
