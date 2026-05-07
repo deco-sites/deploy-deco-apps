@@ -36,6 +36,33 @@ on:
         required: false
         type: string
         default: ""
+      ecr-repository:
+        description: "ECR repository name. When set, skips reading DECO_SITE_NAME from the values file."
+        required: false
+        type: string
+        default: ""
+      values-repo:
+        description: "External repository to update with the new image tag (e.g. decocms/deco-apps-cd). When empty, updates the calling repository."
+        required: false
+        type: string
+        default: ""
+      values-path:
+        description: "Path to the values file within the target repository."
+        required: false
+        type: string
+        default: deploy/values-custom.yaml
+      values-repo-ref:
+        description: "Branch of the external repository to update."
+        required: false
+        type: string
+        default: main
+    secrets:
+      app-id:
+        description: "GitHub App ID for generating tokens to push to external repositories."
+        required: false
+      app-private-key:
+        description: "GitHub App private key for generating tokens to push to external repositories."
+        required: false
 
 env:
   AWS_REGION: ${{ inputs.aws-region }}
@@ -62,24 +89,29 @@ jobs:
           name: ${{ inputs.pre-built-assets-artifact }}
           path: _fresh/
 
-      - name: Get ECR repository name from values file
+      - name: Get ECR repository name
         id: ecr-repo
         run: |
-          VALUES_FILE="deploy/values-custom.yaml"
-          if [ ! -f "$VALUES_FILE" ]; then
-            echo "::error::File ${VALUES_FILE} not found"
-            exit 1
+          if [ -n "${{ inputs.ecr-repository }}" ]; then
+            echo "name=${{ inputs.ecr-repository }}" >> $GITHUB_OUTPUT
+            echo "ECR repository (from input): ${{ inputs.ecr-repository }}"
+          else
+            VALUES_FILE="deploy/values-custom.yaml"
+            if [ ! -f "$VALUES_FILE" ]; then
+              echo "::error::File ${VALUES_FILE} not found"
+              exit 1
+            fi
+
+            ECR_REPO=$(awk '/DECO_SITE_NAME/{getline; if ($1 ~ /value:/) {gsub(/"/,"",$2); print $2; exit}}' "$VALUES_FILE")
+
+            if [ -z "$ECR_REPO" ]; then
+              echo "::error::DECO_SITE_NAME not found in ${VALUES_FILE}"
+              exit 1
+            fi
+
+            echo "name=${ECR_REPO}" >> $GITHUB_OUTPUT
+            echo "ECR repository (from values): ${ECR_REPO}"
           fi
-
-          ECR_REPO=$(awk '/DECO_SITE_NAME/{getline; if ($1 ~ /value:/) {gsub(/"/,"",$2); print $2; exit}}' "$VALUES_FILE")
-
-          if [ -z "$ECR_REPO" ]; then
-            echo "::error::DECO_SITE_NAME not found in ${VALUES_FILE}"
-            exit 1
-          fi
-
-          echo "name=${ECR_REPO}" >> $GITHUB_OUTPUT
-          echo "ECR repository: ${ECR_REPO}"
 
       - name: Set metadata
         id: meta
@@ -136,9 +168,98 @@ jobs:
             ${{ inputs.extra-cache-from }}
           cache-to: type=gha,mode=${{ inputs.cache-mode }}
 
-      - name: Update deploy/values-custom.yaml with short SHA
+      # ── Update values: external repo via GitHub API ──────────────
+      - name: Parse values repo owner and name
+        if: inputs.values-repo != '' && github.event_name != 'pull_request'
+        id: values-repo-parts
         run: |
-          VALUES_FILE="deploy/values-custom.yaml"
+          OWNER=$(echo "${{ inputs.values-repo }}" | cut -d'/' -f1)
+          REPO=$(echo "${{ inputs.values-repo }}" | cut -d'/' -f2)
+          echo "owner=${OWNER}" >> $GITHUB_OUTPUT
+          echo "repo=${REPO}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        if: inputs.values-repo != '' && github.event_name != 'pull_request'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ steps.values-repo-parts.outputs.owner }}
+          repositories: ${{ steps.values-repo-parts.outputs.repo }}
+
+      - name: Update values in external repository
+        if: inputs.values-repo != '' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VALUES_REPO: ${{ inputs.values-repo }}
+          VALUES_PATH: ${{ inputs.values-path }}
+          VALUES_REF: ${{ inputs.values-repo-ref }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          MAX_RETRIES=3
+          RETRY=0
+
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "Fetching ${VALUES_PATH} from ${VALUES_REPO} (ref: ${VALUES_REF})..."
+
+            # GET file content + SHA for optimistic locking
+            RESPONSE=$(gh api "repos/${VALUES_REPO}/contents/${VALUES_PATH}?ref=${VALUES_REF}" 2>&1)
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to fetch file: ${RESPONSE}"
+              exit 1
+            fi
+
+            FILE_SHA=$(echo "$RESPONSE" | jq -r '.sha')
+            CONTENT=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
+
+            # Apply sed replacements
+            UPDATED=$(echo "$CONTENT" | \
+              sed "s/\(tag: \"\)[a-f0-9]\{7\}\(\"*\)/\1${SHORT_SHA}\2/" | \
+              sed "s/\(deploymentId=\)[a-f0-9]\{7\}/\1${SHORT_SHA}/" | \
+              sed "/name: DENO_DEPLOYMENT_ID/{n;s/value:.*/value: ${SHORT_SHA}/;}")
+
+            # Validate substitutions
+            echo "$UPDATED" | grep -q "tag: \"${SHORT_SHA}\"" || { echo "::error::Failed to update image tag"; exit 1; }
+            echo "$UPDATED" | grep -q "deploymentId=${SHORT_SHA}" || { echo "::error::Failed to update deploymentId"; exit 1; }
+            echo "$UPDATED" | grep -A1 "name: DENO_DEPLOYMENT_ID" | grep -q "value: ${SHORT_SHA}" || { echo "::error::Failed to update DENO_DEPLOYMENT_ID"; exit 1; }
+
+            # Base64 encode for API
+            ENCODED=$(echo "$UPDATED" | base64 -w 0)
+
+            # PUT updated file with SHA for optimistic locking
+            HTTP_CODE=$(gh api "repos/${VALUES_REPO}/contents/${VALUES_PATH}" \
+              --method PUT \
+              --field message="chore: update ${VALUES_PATH##*/} deployment to ${SHORT_SHA}" \
+              --field content="${ENCODED}" \
+              --field sha="${FILE_SHA}" \
+              --field branch="${VALUES_REF}" \
+              2>&1) && break
+
+            # Check for conflict (another build updated the same file)
+            if echo "$HTTP_CODE" | grep -q "409"; then
+              RETRY=$((RETRY + 1))
+              echo "Conflict detected (SHA changed). Retry ${RETRY}/${MAX_RETRIES}..."
+              sleep 2
+              continue
+            else
+              echo "::error::Failed to update file: ${HTTP_CODE}"
+              exit 1
+            fi
+          done
+
+          if [ $RETRY -eq $MAX_RETRIES ]; then
+            echo "::error::Max retries reached. Could not update ${VALUES_PATH}."
+            exit 1
+          fi
+
+          echo "Successfully updated ${VALUES_PATH} in ${VALUES_REPO} with SHA ${SHORT_SHA}"
+
+      # ── Update values: local repo (backwards compat) ─────────────
+      - name: Update local values file
+        if: inputs.values-repo == '' && github.event_name != 'pull_request'
+        run: |
+          VALUES_FILE="${{ inputs.values-path }}"
           SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
 
           if [ ! -f "$VALUES_FILE" ]; then
@@ -148,42 +269,30 @@ jobs:
 
           echo "Updating ${VALUES_FILE} with short SHA ${SHORT_SHA}..."
 
-          # Update image tag:
-          # image:
-          #   tag: "xxxxxxx"
           sed -i "s/\(tag: \"\)[a-f0-9]\{7\}\(\"*\)/\1${SHORT_SHA}\2/" "$VALUES_FILE"
-
-          # Update deploymentId=xxxxxxx inside OTEL_RESOURCE_ATTRIBUTES
           sed -i "s/\(deploymentId=\)[a-f0-9]\{7\}/\1${SHORT_SHA}/" "$VALUES_FILE"
-
-          # Update DENO_DEPLOYMENT_ID value
           sed -i "/name: DENO_DEPLOYMENT_ID/{n;s/value:.*/value: ${SHORT_SHA}/;}" "$VALUES_FILE"
 
           echo "Updated content:"
           grep -E 'tag: "|deploymentId=|DENO_DEPLOYMENT_ID' -n "$VALUES_FILE" || true
 
-          # Validate substitutions
           grep -q "tag: \"${SHORT_SHA}\"" "$VALUES_FILE" || { echo "::error::Failed to update image tag"; exit 1; }
           grep -q "deploymentId=${SHORT_SHA}" "$VALUES_FILE" || { echo "::error::Failed to update deploymentId"; exit 1; }
           grep -A1 "name: DENO_DEPLOYMENT_ID" "$VALUES_FILE" | grep -q "value: ${SHORT_SHA}" || { echo "::error::Failed to update DENO_DEPLOYMENT_ID"; exit 1; }
 
-      - name: Commit updated values-custom.yaml
-        if: ${{ github.event_name != 'pull_request' }}
+      - name: Commit and push local changes
+        if: inputs.values-repo == '' && github.event_name != 'pull_request'
         run: |
-          if git diff --quiet deploy/values-custom.yaml; then
-            echo "No changes in deploy/values-custom.yaml; nothing to commit."
+          if git diff --quiet ${{ inputs.values-path }}; then
+            echo "No changes in ${{ inputs.values-path }}; nothing to commit."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add deploy/values-custom.yaml
+          git add ${{ inputs.values-path }}
           git commit -m "chore: update deployment id to ${{ steps.meta.outputs.short_sha }}"
-
-      - name: Push changes
-        if: ${{ github.event_name != 'pull_request' }}
-        run: |
           git push
 
       - name: Output summary
@@ -194,3 +303,7 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.values-repo }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Values updated in** \`${{ inputs.values-repo }}\` at \`${{ inputs.values-path }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
