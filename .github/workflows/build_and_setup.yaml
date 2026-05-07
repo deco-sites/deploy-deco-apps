@@ -68,12 +68,18 @@ env:
   AWS_REGION: ${{ inputs.aws-region }}
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Build Docker image and push to ECR
+  # ---------------------------------------------------------------------------
   build-and-push:
     name: Build and Push to ECR
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
+    outputs:
+      short-sha: ${{ steps.meta.outputs.short_sha }}
+      ecr-image: ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}
 
     steps:
       - name: Checkout repository
@@ -168,9 +174,31 @@ jobs:
             ${{ inputs.extra-cache-from }}
           cache-to: type=gha,mode=${{ inputs.cache-mode }}
 
-      # ── Update values: external repo via GitHub API ──────────────
+      - name: Output summary
+        run: |
+          echo "## Release commit ${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Docker image (ECR)**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Update values file with the new image tag.
+  # Runs as a separate job so it can be re-run independently on failure.
+  # ---------------------------------------------------------------------------
+  update-values:
+    name: Update Values
+    needs: [build-and-push]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ── External repo: update via GitHub API (no clone) ────────────
       - name: Parse values repo owner and name
-        if: inputs.values-repo != '' && github.event_name != 'pull_request'
+        if: inputs.values-repo != ''
         id: values-repo-parts
         run: |
           OWNER=$(echo "${{ inputs.values-repo }}" | cut -d'/' -f1)
@@ -179,7 +207,7 @@ jobs:
           echo "repo=${REPO}" >> $GITHUB_OUTPUT
 
       - name: Generate GitHub App token
-        if: inputs.values-repo != '' && github.event_name != 'pull_request'
+        if: inputs.values-repo != ''
         id: app-token
         uses: actions/create-github-app-token@v1
         with:
@@ -189,13 +217,13 @@ jobs:
           repositories: ${{ steps.values-repo-parts.outputs.repo }}
 
       - name: Update values in external repository
-        if: inputs.values-repo != '' && github.event_name != 'pull_request'
+        if: inputs.values-repo != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VALUES_REPO: ${{ inputs.values-repo }}
           VALUES_PATH: ${{ inputs.values-path }}
           VALUES_REF: ${{ inputs.values-repo-ref }}
-          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          SHORT_SHA: ${{ needs.build-and-push.outputs.short-sha }}
         run: |
           MAX_RETRIES=3
           RETRY=0
@@ -255,12 +283,16 @@ jobs:
 
           echo "Successfully updated ${VALUES_PATH} in ${VALUES_REPO} with SHA ${SHORT_SHA}"
 
-      # ── Update values: local repo (backwards compat) ─────────────
+      # ── Local repo: update file, commit, push ──────────────────────
+      - name: Checkout repository
+        if: inputs.values-repo == ''
+        uses: actions/checkout@v4
+
       - name: Update local values file
-        if: inputs.values-repo == '' && github.event_name != 'pull_request'
+        if: inputs.values-repo == ''
         run: |
           VALUES_FILE="${{ inputs.values-path }}"
-          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          SHORT_SHA="${{ needs.build-and-push.outputs.short-sha }}"
 
           if [ ! -f "$VALUES_FILE" ]; then
             echo "::error::File ${VALUES_FILE} not found to update tag/deploymentId"
@@ -281,7 +313,7 @@ jobs:
           grep -A1 "name: DENO_DEPLOYMENT_ID" "$VALUES_FILE" | grep -q "value: ${SHORT_SHA}" || { echo "::error::Failed to update DENO_DEPLOYMENT_ID"; exit 1; }
 
       - name: Commit and push local changes
-        if: inputs.values-repo == '' && github.event_name != 'pull_request'
+        if: inputs.values-repo == ''
         run: |
           if git diff --quiet ${{ inputs.values-path }}; then
             echo "No changes in ${{ inputs.values-path }}; nothing to commit."
@@ -292,18 +324,14 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add ${{ inputs.values-path }}
-          git commit -m "chore: update deployment id to ${{ steps.meta.outputs.short_sha }}"
+          git commit -m "chore: update deployment id to ${{ needs.build-and-push.outputs.short-sha }}"
           git push
 
       - name: Output summary
         run: |
-          echo "## Release commit ${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Docker image (ECR)**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          SHORT_SHA="${{ needs.build-and-push.outputs.short-sha }}"
           if [ -n "${{ inputs.values-repo }}" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Values updated in** \`${{ inputs.values-repo }}\` at \`${{ inputs.values-path }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Values updated in** \`${{ inputs.values-repo }}\` at \`${{ inputs.values-path }}\` → \`${SHORT_SHA}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Values updated in** \`${{ inputs.values-path }}\` → \`${SHORT_SHA}\`" >> $GITHUB_STEP_SUMMARY
           fi
