@@ -41,6 +41,16 @@ on:
         required: false
         type: string
         default: ""
+      codeartifact-domain:
+        description: "AWS CodeArtifact domain. When set, the workflow resolves a 1h npm registry endpoint + auth token via OIDC and forwards them to docker build as NPM_CONFIG_REGISTRY and NPM_AUTH_TOKEN build-args. The Dockerfile is responsible for writing an .npmrc that uses NPM_AUTH_TOKEN."
+        required: false
+        type: string
+        default: ""
+      codeartifact-repository:
+        description: "AWS CodeArtifact repository name (the npm-format mirror). Required when codeartifact-domain is set."
+        required: false
+        type: string
+        default: ""
       ecr-repository:
         description: "ECR repository name. When set, skips reading DECO_SITE_NAME from the values file."
         required: false
@@ -160,6 +170,24 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Resolve CodeArtifact registry endpoint and token
+        id: codeartifact
+        if: inputs.codeartifact-domain != ''
+        run: |
+          set -eu
+          ENDPOINT=$(aws codeartifact get-repository-endpoint \
+            --domain "${{ inputs.codeartifact-domain }}" \
+            --repository "${{ inputs.codeartifact-repository }}" \
+            --format npm \
+            --query repositoryEndpoint --output text)
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain "${{ inputs.codeartifact-domain }}" \
+            --duration-seconds 3600 \
+            --query authorizationToken --output text)
+          # Step outputs (intra-job) — not blocked by GHA cross-job mask check.
+          echo "registry=$ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -174,7 +202,10 @@ jobs:
           platforms: ${{ inputs.platforms }}
           provenance: false
           sbom: false
-          build-args: ${{ inputs.build-args }}
+          build-args: |
+            ${{ inputs.build-args }}
+            ${{ steps.codeartifact.outputs.registry && format('NPM_CONFIG_REGISTRY={0}', steps.codeartifact.outputs.registry) || '' }}
+            ${{ steps.codeartifact.outputs.token && format('NPM_AUTH_TOKEN={0}', steps.codeartifact.outputs.token) || '' }}
           cache-from: |
             type=gha
             ${{ inputs.extra-cache-from }}
