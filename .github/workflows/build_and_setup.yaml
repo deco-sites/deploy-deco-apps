@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      build-args:
+        description: "Multi-line build args forwarded to docker/build-push-action (one KEY=VALUE per line). Useful to pass NPM_CONFIG_REGISTRY, feature flags, etc."
+        required: false
+        type: string
+        default: ""
       ecr-repository:
         description: "ECR repository name. When set, skips reading DECO_SITE_NAME from the values file."
         required: false
@@ -169,6 +174,7 @@ jobs:
           platforms: ${{ inputs.platforms }}
           provenance: false
           sbom: false
+          build-args: ${{ inputs.build-args }}
           cache-from: |
             type=gha
             ${{ inputs.extra-cache-from }}
