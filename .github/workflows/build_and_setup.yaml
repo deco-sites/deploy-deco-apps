@@ -42,7 +42,7 @@ on:
         type: string
         default: ""
       codeartifact-domain:
-        description: "AWS CodeArtifact domain. When set, the workflow resolves a 1h npm registry endpoint + auth token via OIDC and forwards them to docker build as NPM_CONFIG_REGISTRY and NPM_AUTH_TOKEN build-args. The Dockerfile is responsible for writing an .npmrc that uses NPM_AUTH_TOKEN."
+        description: "AWS CodeArtifact domain. When set, the workflow resolves a 1h npm registry endpoint + auth token via OIDC. The endpoint is passed as NPM_CONFIG_REGISTRY build-arg; the token is passed via a BuildKit secret-file (id=npmrc), so the Dockerfile must mount it: `RUN --mount=type=secret,id=npmrc,target=/root/.npmrc ...`. Token never appears in build-args, image layers, or BuildKit failure echoes."
         required: false
         type: string
         default: ""
@@ -170,7 +170,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Resolve CodeArtifact registry endpoint and token
+      - name: Resolve CodeArtifact registry and write npmrc secret
         id: codeartifact
         if: inputs.codeartifact-domain != ''
         run: |
@@ -184,9 +184,21 @@ jobs:
             --domain "${{ inputs.codeartifact-domain }}" \
             --duration-seconds 3600 \
             --query authorizationToken --output text)
-          # Step outputs (intra-job) — not blocked by GHA cross-job mask check.
+          HOST_PATH="${ENDPOINT#https://}"
+          HOST_PATH="${HOST_PATH%/}"
+          # Endpoint is non-sensitive; flows through build-args.
+          # Token goes through BuildKit secret mount so it never lands in
+          # build-args, image layers, docker history, or BuildKit failure
+          # echo. Written to a per-run tmp file under $RUNNER_TEMP.
+          NPMRC_FILE="${RUNNER_TEMP}/codeartifact-npmrc"
+          {
+            echo "registry=${ENDPOINT}"
+            echo "//${HOST_PATH}/:_authToken=${TOKEN}"
+            echo "always-auth=true"
+          } > "$NPMRC_FILE"
+          chmod 600 "$NPMRC_FILE"
           echo "registry=$ENDPOINT" >> "$GITHUB_OUTPUT"
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "npmrc-file=$NPMRC_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -205,11 +217,16 @@ jobs:
           build-args: |
             ${{ inputs.build-args }}
             ${{ steps.codeartifact.outputs.registry && format('NPM_CONFIG_REGISTRY={0}', steps.codeartifact.outputs.registry) || '' }}
-            ${{ steps.codeartifact.outputs.token && format('NPM_AUTH_TOKEN={0}', steps.codeartifact.outputs.token) || '' }}
+          secret-files: |
+            ${{ steps.codeartifact.outputs.npmrc-file && format('npmrc={0}', steps.codeartifact.outputs.npmrc-file) || '' }}
           cache-from: |
             type=gha
             ${{ inputs.extra-cache-from }}
           cache-to: type=gha,mode=${{ inputs.cache-mode }}
+
+      - name: Clean up npmrc secret file
+        if: always() && steps.codeartifact.outputs.npmrc-file != ''
+        run: rm -f "${{ steps.codeartifact.outputs.npmrc-file }}"
 
       - name: Output summary
         run: |
