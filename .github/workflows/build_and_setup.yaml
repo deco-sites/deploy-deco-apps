@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      pre-built-assets-path:
+        description: "Where to extract `pre-built-assets-artifact` inside the workspace. Default `_fresh/` matches legacy callers shipping only the Fresh bundle. Set to `.` when the artifact contains a full pre-built workspace (e.g. node_modules/, .deno-dir/, _fresh/) so the contents land at repo root and a single-stage Dockerfile can just COPY them."
+        required: false
+        type: string
+        default: "_fresh/"
       build-args:
         description: "Multi-line build args forwarded to docker/build-push-action (one KEY=VALUE per line). Useful to pass NPM_CONFIG_REGISTRY, feature flags, etc."
         required: false
@@ -108,7 +113,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.pre-built-assets-artifact }}
-          path: _fresh/
+          path: ${{ inputs.pre-built-assets-path }}
 
       - name: Get ECR repository name
         id: ecr-repo
