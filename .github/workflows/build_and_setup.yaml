@@ -264,10 +264,20 @@ jobs:
             ${{ steps.codeartifact.outputs.registry && format('NPM_CONFIG_REGISTRY={0}', steps.codeartifact.outputs.registry) || '' }}
           secret-files: |
             ${{ steps.codeartifact.outputs.npmrc-file && format('npmrc={0}', steps.codeartifact.outputs.npmrc-file) || '' }}
+          # Registry-backed cache: BuildKit pushes the deps stage's
+          # layers to a fixed cache tag in the same ECR repo. Subsequent
+          # builds (any branch) pull it back and reuse the deno install +
+          # deno cache layers without re-executing them. Tag is fixed
+          # per arch so the cache rotates in place; the previous manifest
+          # becomes untagged and the ECR lifecycle policy expires it.
+          # mode=max exports every intermediate layer (not just the
+          # final image). image-manifest=true forces the OCI image
+          # manifest format ECR accepts (the BuildKit default index
+          # format is rejected by ECR).
           cache-from: |
-            type=gha,scope=${{ matrix.arch }}
+            type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ needs.prep.outputs.ecr-repo }}:cache-${{ matrix.arch }}
             ${{ inputs.extra-cache-from }}
-          cache-to: type=gha,mode=${{ inputs.cache-mode }},scope=${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ needs.prep.outputs.ecr-repo }}:cache-${{ matrix.arch }},mode=${{ inputs.cache-mode }},image-manifest=true,oci-mediatypes=true
 
       - name: Clean up npmrc secret file
         if: always() && steps.codeartifact.outputs.npmrc-file != ''
