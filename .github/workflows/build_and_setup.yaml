@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       platforms:
-        description: "Docker build platforms (e.g. linux/amd64 or linux/amd64,linux/arm64)"
+        description: "Docker build platforms. Comma-separated list. Supported: linux/amd64, linux/arm64. Each requested arch is built on its native GitHub-hosted runner (no QEMU); a final manifest-list tag (no arch suffix) is then created to point at the per-arch images."
         required: false
         type: string
         default: linux/amd64,linux/arm64
@@ -37,7 +37,7 @@ on:
         type: string
         default: ""
       pre-built-assets-path:
-        description: "Where to extract `pre-built-assets-artifact` inside the workspace. Default `_fresh/` matches legacy callers shipping only the Fresh bundle. Set to `.` when the artifact contains a full pre-built workspace (e.g. node_modules/, .deno-dir/, _fresh/) so the contents land at repo root and a single-stage Dockerfile can just COPY them."
+        description: "Where to extract `pre-built-assets-artifact` inside the workspace. Default `_fresh/` matches legacy callers shipping only the Fresh bundle. Set to `.` when the artifact contains a full pre-built workspace so the contents land at repo root."
         required: false
         type: string
         default: "_fresh/"
@@ -89,17 +89,89 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build Docker image and push to ECR
+  # Prep: parse platforms input into a build matrix and resolve repo-level
+  # metadata once, so the matrix jobs don't duplicate work or diverge.
   # ---------------------------------------------------------------------------
-  build-and-push:
-    name: Build and Push to ECR
+  prep:
+    name: Prep
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      ecr-repo: ${{ steps.ecr-repo.outputs.name }}
+      short-sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get ECR repository name
+        id: ecr-repo
+        run: |
+          if [ -n "${{ inputs.ecr-repository }}" ]; then
+            echo "name=${{ inputs.ecr-repository }}" >> $GITHUB_OUTPUT
+            echo "ECR repository (from input): ${{ inputs.ecr-repository }}"
+          else
+            VALUES_FILE="deploy/values-custom.yaml"
+            if [ ! -f "$VALUES_FILE" ]; then
+              echo "::error::File ${VALUES_FILE} not found"
+              exit 1
+            fi
+            ECR_REPO=$(awk '/DECO_SITE_NAME/{getline; if ($1 ~ /value:/) {gsub(/"/,"",$2); print $2; exit}}' "$VALUES_FILE")
+            if [ -z "$ECR_REPO" ]; then
+              echo "::error::DECO_SITE_NAME not found in ${VALUES_FILE}"
+              exit 1
+            fi
+            echo "name=${ECR_REPO}" >> $GITHUB_OUTPUT
+            echo "ECR repository (from values): ${ECR_REPO}"
+          fi
+
+      - name: Set metadata
+        id: meta
+        run: |
+          echo "full_sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Build matrix from platforms input
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -eu
+          # Map each supported platform to its native GitHub-hosted runner so
+          # docker buildx never has to invoke QEMU. Order is deterministic
+          # (amd64 first) so logs and dashboards read consistently.
+          INCLUDES=()
+          if echo ",$PLATFORMS," | grep -q ',linux/amd64,'; then
+            INCLUDES+=('{"arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"}')
+          fi
+          if echo ",$PLATFORMS," | grep -q ',linux/arm64,'; then
+            INCLUDES+=('{"arch":"arm64","platform":"linux/arm64","runner":"ubuntu-22.04-arm"}')
+          fi
+          if [ ${#INCLUDES[@]} -eq 0 ]; then
+            echo "::error::No supported platform in '$PLATFORMS' (expected linux/amd64 and/or linux/arm64)"
+            exit 1
+          fi
+          JOINED=$(IFS=,; echo "${INCLUDES[*]}")
+          echo "matrix={\"include\":[${JOINED}]}" >> $GITHUB_OUTPUT
+          echo "Matrix: {\"include\":[${JOINED}]}"
+
+  # ---------------------------------------------------------------------------
+  # Build: one native job per requested architecture. Each pushes an
+  # arch-suffixed tag (`<image>:<sha>-amd64`, `<image>:<sha>-arm64`); the
+  # manifest-list (the tag callers actually deploy) is assembled in the
+  # `build-and-push` job below from these per-arch tags.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: [prep]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prep.outputs.matrix) }}
     permissions:
-      contents: write
+      contents: read
       id-token: write
     outputs:
-      short-sha: ${{ steps.meta.outputs.short_sha }}
-      ecr-image: ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
 
     steps:
       - name: Checkout repository
@@ -115,36 +187,6 @@ jobs:
           name: ${{ inputs.pre-built-assets-artifact }}
           path: ${{ inputs.pre-built-assets-path }}
 
-      - name: Get ECR repository name
-        id: ecr-repo
-        run: |
-          if [ -n "${{ inputs.ecr-repository }}" ]; then
-            echo "name=${{ inputs.ecr-repository }}" >> $GITHUB_OUTPUT
-            echo "ECR repository (from input): ${{ inputs.ecr-repository }}"
-          else
-            VALUES_FILE="deploy/values-custom.yaml"
-            if [ ! -f "$VALUES_FILE" ]; then
-              echo "::error::File ${VALUES_FILE} not found"
-              exit 1
-            fi
-
-            ECR_REPO=$(awk '/DECO_SITE_NAME/{getline; if ($1 ~ /value:/) {gsub(/"/,"",$2); print $2; exit}}' "$VALUES_FILE")
-
-            if [ -z "$ECR_REPO" ]; then
-              echo "::error::DECO_SITE_NAME not found in ${VALUES_FILE}"
-              exit 1
-            fi
-
-            echo "name=${ECR_REPO}" >> $GITHUB_OUTPUT
-            echo "ECR repository (from values): ${ECR_REPO}"
-          fi
-
-      - name: Set metadata
-        id: meta
-        run: |
-          echo "full_sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-          echo "short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)" >> $GITHUB_OUTPUT
-
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -152,18 +194,20 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR repository exists
+        # Idempotent — safe to run in every matrix job. The first concurrent
+        # run wins the create; the others see "already exists" and move on.
         env:
           ECR_REPOSITORY_POLICY_JSON: ${{ inputs.ecr-repository-policy-json }}
         run: |
-          if aws ecr describe-repositories --repository-names ${{ steps.ecr-repo.outputs.name }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
-            echo "Repository ${{ steps.ecr-repo.outputs.name }} already exists"
+          if aws ecr describe-repositories --repository-names ${{ needs.prep.outputs.ecr-repo }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Repository ${{ needs.prep.outputs.ecr-repo }} already exists"
           else
-            echo "Creating ECR repository ${{ steps.ecr-repo.outputs.name }} (first pipeline run)"
-            aws ecr create-repository --repository-name ${{ steps.ecr-repo.outputs.name }} --region ${{ env.AWS_REGION }}
+            echo "Creating ECR repository ${{ needs.prep.outputs.ecr-repo }} (first pipeline run)"
+            aws ecr create-repository --repository-name ${{ needs.prep.outputs.ecr-repo }} --region ${{ env.AWS_REGION }}
             if [ -n "$ECR_REPOSITORY_POLICY_JSON" ]; then
               echo "$ECR_REPOSITORY_POLICY_JSON" > /tmp/ecr-policy.json
               aws ecr set-repository-policy \
-                --repository-name ${{ steps.ecr-repo.outputs.name }} \
+                --repository-name ${{ needs.prep.outputs.ecr-repo }} \
                 --policy-text file:///tmp/ecr-policy.json \
                 --region ${{ env.AWS_REGION }}
               echo "Repository policy applied."
@@ -191,10 +235,6 @@ jobs:
             --query authorizationToken --output text)
           HOST_PATH="${ENDPOINT#https://}"
           HOST_PATH="${HOST_PATH%/}"
-          # Endpoint is non-sensitive; flows through build-args.
-          # Token goes through BuildKit secret mount so it never lands in
-          # build-args, image layers, docker history, or BuildKit failure
-          # echo. Written to a per-run tmp file under $RUNNER_TEMP.
           NPMRC_FILE="${RUNNER_TEMP}/codeartifact-npmrc"
           {
             echo "registry=${ENDPOINT}"
@@ -208,15 +248,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image
+      - name: Build and push (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}
-          platforms: ${{ inputs.platforms }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ needs.prep.outputs.ecr-repo }}:${{ needs.prep.outputs.short-sha }}-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
           provenance: false
           sbom: false
           build-args: |
@@ -225,22 +265,76 @@ jobs:
           secret-files: |
             ${{ steps.codeartifact.outputs.npmrc-file && format('npmrc={0}', steps.codeartifact.outputs.npmrc-file) || '' }}
           cache-from: |
-            type=gha
+            type=gha,scope=${{ matrix.arch }}
             ${{ inputs.extra-cache-from }}
-          cache-to: type=gha,mode=${{ inputs.cache-mode }}
+          cache-to: type=gha,mode=${{ inputs.cache-mode }},scope=${{ matrix.arch }}
 
       - name: Clean up npmrc secret file
         if: always() && steps.codeartifact.outputs.npmrc-file != ''
         run: rm -f "${{ steps.codeartifact.outputs.npmrc-file }}"
 
-      - name: Output summary
+  # ---------------------------------------------------------------------------
+  # Manifest: stitch the per-arch tags into the manifest-list that callers
+  # actually deploy (`<image>:<sha>`, no arch suffix). Job name and outputs
+  # are kept stable as `build-and-push` for back-compat with downstream
+  # `needs:` references (e.g. update-values).
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build and Push to ECR
+    needs: [prep, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      short-sha: ${{ needs.prep.outputs.short-sha }}
+      ecr-image: ${{ steps.login-ecr.outputs.registry }}/${{ needs.prep.outputs.ecr-repo }}:${{ needs.prep.outputs.short-sha }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifest list
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO: ${{ needs.prep.outputs.ecr-repo }}
+          SHA: ${{ needs.prep.outputs.short-sha }}
+          MATRIX_JSON: ${{ needs.prep.outputs.matrix }}
         run: |
-          echo "## Release commit ${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Docker image (ECR)**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.name }}:${{ steps.meta.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          set -eu
+          SOURCES=$(echo "$MATRIX_JSON" | jq -r '.include[].arch' | while read arch; do
+            echo "${REGISTRY}/${REPO}:${SHA}-${arch}"
+          done | tr '\n' ' ')
+          echo "Merging into ${REGISTRY}/${REPO}:${SHA} from: $SOURCES"
+          docker buildx imagetools create \
+            --tag "${REGISTRY}/${REPO}:${SHA}" \
+            $SOURCES
+
+      - name: Output summary
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO: ${{ needs.prep.outputs.ecr-repo }}
+          SHA: ${{ needs.prep.outputs.short-sha }}
+        run: |
+          {
+            echo "## Release commit ${SHA}"
+            echo ""
+            echo "**Docker image (ECR)**"
+            echo ""
+            echo '```'
+            echo "${REGISTRY}/${REPO}:${SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Update values file with the new image tag.
